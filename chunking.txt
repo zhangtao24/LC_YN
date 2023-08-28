@@ -1,0 +1,191 @@
+var roi = LL;
+function rmS2cloud(image) {
+  var qa = image.select('QA60');
+
+//去云 
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+      .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+
+  return image.updateMask(mask).toDouble()//.divide(10000)
+              .copyProperties(image)
+              .copyProperties(image, ["system:time_start", "system:time_end"])
+}
+
+var S2_BANDS  = ['B2',   'B3',    'B4',  'B8',  'B11',   'B12']; // Sentinel-2
+
+var S2Collection = ee.ImageCollection('COPERNICUS/S2_SR')//.filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE',50))
+                .filterDate('2020-01-01', '2020-12-31')
+                .filterBounds(roi)
+                .map(rmS2cloud)
+                .median()
+                .clip(roi);
+                
+var LL_clipped = S2Collection.clipToCollection(LL);
+//print(ys_clipped);
+Map.addLayer(LL_clipped, {'min':0,'max':3000,'bands':['B4','B3','B2']},'S2Collection');
+print(LL_clipped)
+Map.addLayer(LL,{"color":'red',},'Region',false);
+
+  var NDVI = LL_clipped.normalizedDifference(['B8', 'B4']).rename ('NDVI');
+
+  var EVI = LL_clipped.expression('2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 10000))', {
+        'NIR': LL_clipped.select('B8'),
+        'RED': LL_clipped.select('B4'),
+        'BLUE': LL_clipped.select('B2')})
+        .rename('EVI').float();
+var SAVI = LL_clipped.expression(
+      '(1 + L) * float(nir - red)/ (nir + red + L)', {
+        'nir': LL_clipped.select('B8'),
+        'red': LL_clipped.select('B4'),
+        'L': 0.2
+      })
+        .rename('SAVI').float();
+// calculate RVI
+  var RVI = LL_clipped.expression('(REDe / RED)', {
+        'REDe': LL_clipped.select('B8A'),
+        'RED': LL_clipped.select('B4')})
+        .rename('RVI').float();
+// calculate DVI
+  var DVI = LL_clipped.expression('(REDe - RED)', {
+        'REDe': LL_clipped.select('B8A'),
+        'RED': LL_clipped.select('B4')})
+        .rename('DVI').float();
+
+  var LSWI = LL_clipped.normalizedDifference(['B8','B12']).rename ('LSWI');  
+  var NDBI = LL_clipped.normalizedDifference(['B12','B8']).rename ('NDBI');
+  var NDWI = LL_clipped.normalizedDifference(['B3','B8']).rename ('NDWI');
+  var NDWI1 = LL_clipped.normalizedDifference(['B3','B8A']).rename ('NDWI1');
+  var MNDWI = LL_clipped.normalizedDifference(['B3', 'B11']).rename ('MNDWI');
+             
+var collectionS1=ee.ImageCollection('COPERNICUS/S1_GRD')
+.filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+
+.filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'));
+
+var collectionS1_IW=collectionS1
+
+.filterBounds(LL)
+
+.filterMetadata('instrumentMode','equals','IW')
+
+.filterDate('2020-01-01', '2020-12-31');
+
+var Sentinel_1=collectionS1_IW.median().clip(LL);
+
+//获取SRTMGL1_003 数据
+var dataset = ee.Image('USGS/SRTMGL1_003')
+                .clip(roi);
+var terrain = ee.Algorithms.Terrain(dataset);
+
+var LL_clipped1=ee.Image.cat([LL_clipped,terrain,Sentinel_1]).float().clip(LL)
+       
+var composite_add = LL_clipped1.addBands(NDVI)
+                                .addBands(NDWI)
+                                .addBands(LSWI)
+                                .addBands(EVI)
+                                .addBands(NDBI)
+                                .addBands(RVI)
+                                .addBands(DVI)
+                                .addBands(NDWI1)
+                                .addBands(MNDWI)
+                                .addBands(SAVI)
+
+
+print(composite_add);
+
+var bands = ['slope','B1',  'B4',  'B6', 
+'B7','B8','B8A','B11','B12','VV','VH','NDWI1','NDVI','NDWI','LSWI','RVI','SAVI',
+'MNDWI','elevation','B9','NDBI','DVI'];
+
+
+/**************************************************************************
+generate the grid
+***************************************************************************/
+var generateGrid = function(xmin, ymin, xmax, ymax, dx, dy) {
+  // var dx = (ee.Number(xmax).subtract(xmin)).divide(2); //4
+  // var dy = (ee.Number(ymax).subtract(ymin)).divide(2);
+  var xx = ee.List.sequence(xmin, ee.Number(xmax).subtract(0.0001), dx);
+  var yy = ee.List.sequence(ymin, ee.Number(ymax).subtract(0.0001), dy);
+  
+  var cells = xx.map(function(x) {
+    return yy.map(function(y) {
+      var x1 = ee.Number(x);
+      var x2 = ee.Number(x).add(ee.Number(dx));
+      var y1 = ee.Number(y);
+      var y2 = ee.Number(y).add(ee.Number(dy));
+      var coords = ee.List([x1, y1, x2, y2]);
+      var rect = ee.Algorithms.GeometryConstructors.Rectangle(coords);   //生成矩形
+      return ee.Feature(rect);
+    });
+  }).flatten();   //变成单个数组
+
+  return ee.FeatureCollection(cells);
+};
+
+var bounds = roi.geometry().bounds();
+var coords = ee.List(bounds.coordinates().get(0));
+var xmin = ee.List(coords.get(0)).get(0);
+var ymin = ee.List(coords.get(0)).get(1);
+var xmax = ee.List(coords.get(2)).get(0);
+var ymax = ee.List(coords.get(2)).get(1);
+
+// var dx = (ee.Number(xmax).subtract(xmin)).divide(5); 
+// var dy = (ee.Number(ymax).subtract(ymin)).divide(5);
+var dx = 1;
+var dy = 1;
+// print("dx, dy", dx, dy);
+
+
+var grid = generateGrid(xmin, ymin, xmax, ymax, dx, dy);    //设置参数，生成格网
+var grid = grid.filterBounds(roi); // filter out out-of-boundary tiles
+
+// print(grid.size());
+Map.addLayer(grid, {color:'orange'}, 'grid');
+// print(grid.first());
+
+var gridSize = grid.size().getInfo();
+// print("gridSize size:", gridSize);
+var gridList = grid.toList(gridSize);
+
+var ls = [];
+
+//*******************************************************************分块分类  
+for(var i=0; i<gridSize; i++){
+    var local_grid1 = ee.Feature(gridList.get(i));
+ 
+  var bounds1 = local_grid1.geometry().bounds();
+  var coords1 = ee.List(bounds1.coordinates().get(0));
+  var region_Lon_min1 = ee.Number(ee.List(coords1.get(0)).get(0)).subtract(dx);
+  var region_Lat_min1 = ee.Number(ee.List(coords1.get(0)).get(1)).subtract(dy);
+  var region_Lon_max1 = ee.Number(ee.List(coords1.get(2)).get(0)).add(dx);
+  var region_Lat_max1 = ee.Number(ee.List(coords1.get(2)).get(1)).add(dy);
+
+  var roi_tmp1 = ee.Geometry.Polygon(
+          [[[region_Lon_min1, region_Lat_max1],
+            [region_Lon_max1, region_Lat_max1],
+            [region_Lon_max1, region_Lat_min1],
+            [region_Lon_min1, region_Lat_min1],
+            [region_Lon_min1, region_Lat_max1]]]);
+
+  var roi_tmp1 = roi_tmp1.intersection(roi.geometry(),0.5)
+    // Map.addLayer(roi_tmp1,{'color':'red'},'roi_tmp'+i)
+
+var trainedClassifier = ee.Classifier.smileRandomForest(115).train({
+    features: trainingPartition.filterBounds(roi_tmp1),
+    classProperty: 'landcover',
+    inputProperties: bands
+  });
+  
+    // //对sentinel进行分类
+  var class_img = composite_add.clip(local_grid1).classify(trainedClassifier);
+
+  ls.push(ee.Image(class_img));
+}
+var class_img = ee.ImageCollection(ls).mosaic();
+ls = null;
+composite_add = null;
+
+Map.addLayer(class_img.randomVisualizer(), null,'classification');

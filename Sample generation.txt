@@ -1,0 +1,424 @@
+
+var roi = LL;
+//ESA 10m
+var dataset = ee.ImageCollection("ESA/WorldCover/v100").first();
+var dataset1 = dataset.clip(LL);
+
+//CLCD
+var CLCD_2020 = ee.Image("users/GEEStudyRoom/CLCDImageCollection/CLCD_v01_2020")
+var CLCD_2015 = ee.Image("users/GEEStudyRoom/CLCDImageCollection/CLCD_v01_2015")
+var CLCD_2020 = CLCD_2020.clip(roi);
+
+//FROM-CLD
+var image1 = ee.Image("users/1065531055/090E30N")
+var image2 = ee.Image("users/1065531055/100E30N")
+var imageCollection=ee.ImageCollection([image1,image2])
+var from_cld=imageCollection.mosaic().clip(LL)
+
+//ESRI
+function clip(Image){
+  return Image.clip(LL)
+}
+var esri_lulc10 = ee.ImageCollection("projects/sat-io/open-datasets/landcover/ESRI_Global-LULC_10m").map(clip)
+var esri10 = esri_lulc10
+                .filterBounds(LL)
+                .mosaic()
+                .clip(LL)
+
+/**************************************************************************
+generate the grid
+***************************************************************************/
+var generateGrid = function(xmin, ymin, xmax, ymax, dx, dy) {
+  // var dx = (ee.Number(xmax).subtract(xmin)).divide(2); //4
+  // var dy = (ee.Number(ymax).subtract(ymin)).divide(2);
+  var xx = ee.List.sequence(xmin, ee.Number(xmax).subtract(0.0001), dx);
+  var yy = ee.List.sequence(ymin, ee.Number(ymax).subtract(0.0001), dy);
+  
+  var cells = xx.map(function(x) {
+    return yy.map(function(y) {
+      var x1 = ee.Number(x);
+      var x2 = ee.Number(x).add(ee.Number(dx));
+      var y1 = ee.Number(y);
+      var y2 = ee.Number(y).add(ee.Number(dy));
+      var coords = ee.List([x1, y1, x2, y2]);
+      var rect = ee.Algorithms.GeometryConstructors.Rectangle(coords);   //Generate Rectangle
+      return ee.Feature(rect);
+    });
+  }).flatten();   //变成单个数组
+
+  return ee.FeatureCollection(cells);
+};
+
+var bounds = roi.geometry().bounds();
+var coords = ee.List(bounds.coordinates().get(0));
+var xmin = ee.List(coords.get(0)).get(0);
+var ymin = ee.List(coords.get(0)).get(1);
+var xmax = ee.List(coords.get(2)).get(0);
+var ymax = ee.List(coords.get(2)).get(1);
+
+// var dx = (ee.Number(xmax).subtract(xmin)).divide(4); //4
+// var dy = (ee.Number(ymax).subtract(ymin)).divide(5);
+var dx = 1;
+var dy = 1;
+// print("dx, dy", dx, dy);
+
+
+var grid = generateGrid(xmin, ymin, xmax, ymax, dx, dy);    //Setting parameters and generating grids
+var grid = grid.filterBounds(roi); // filter out out-of-boundary tiles
+
+print(grid.size());
+Map.addLayer(grid, {color:'orange'}, 'grid');
+// print(grid.first());
+
+var gridSize = grid.size().getInfo();
+// print("gridSize size:", gridSize);
+var gridList = grid.toList(gridSize);
+
+
+//*******************************************************************piecemeal sampling
+
+var Grassland_sample0=ee.FeatureCollection(ee.Feature(null))
+var foret_sample0=ee.FeatureCollection(ee.Feature(null))
+var cropland_sample0=ee.FeatureCollection(ee.Feature(null))
+var water_sample0=ee.FeatureCollection(ee.Feature(null))
+var other_sample0=ee.FeatureCollection(ee.Feature(null))
+var urban_sample0=ee.FeatureCollection(ee.Feature(null))
+var Shrubland_sample0=ee.FeatureCollection(ee.Feature(null))
+//
+
+for(var i=0; i<gridSize; i++){
+
+  var local_grid = ee.Feature(gridList.get(i));
+
+  var bounds = local_grid.geometry().bounds();
+  var coords = ee.List(bounds.coordinates().get(0));
+  var region_Lon_min = ee.List(coords.get(0)).get(0);
+  var region_Lat_min = ee.List(coords.get(0)).get(1);
+  var region_Lon_max = ee.List(coords.get(2)).get(0);
+  var region_Lat_max = ee.List(coords.get(2)).get(1);
+
+  var roi_tmp = ee.Geometry.Polygon(
+          [[[region_Lon_min, region_Lat_max],
+            [region_Lon_max, region_Lat_max],
+            [region_Lon_max, region_Lat_min],
+            [region_Lon_min, region_Lat_min],
+            [region_Lon_min, region_Lat_max]]]);
+  var roi_tmp = ee.FeatureCollection(roi_tmp).filterBounds(roi);
+  // Map.addLayer(roi_tmp,{'color':'red'},'roi_tmp'+i)
+  
+// //----------------------------------------------------Grassland
+
+var Grassland_CLCD_2020 = CLCD_2020.eq(4);
+var Grassland_CLCD_2015 = CLCD_2015.eq(4);
+var Grassland_ESA = dataset1.eq(30);
+var Grassland_ESRI = esri10.eq(3);
+var Grassland_FROM = from_cld.eq(3);
+
+var Grassland_and = Grassland_CLCD_2015.and(Grassland_CLCD_2020).and(Grassland_ESA.or(Grassland_ESRI)).and(Grassland_FROM);
+
+var Grassland1 = Grassland_and.clip(roi_tmp).rename('Grassland')
+                                  .set('system:footprint', roi_tmp.geometry());
+
+// Define a kernel representing the center pixel and its 8 neighbors
+var kernel = ee.Kernel.fixed(3, 3, [[1, 1, 1], [1, 1, 1], [1, 1, 1]]);
+
+// Define a function to classify pixels based on the kernel
+var classifyCenterPixels = function(image) {
+  var centerPixel = image.reduceNeighborhood({
+    reducer: ee.Reducer.first(),
+    kernel: kernel,
+  });
+  var mask = centerPixel.neq(0).and(centerPixel.eq(image));
+  return image.updateMask(mask);
+};
+
+// Apply the classification function to the forest image
+var classified_Grassland = classifyCenterPixels(Grassland1);
+
+// Generate stratified samples from the classified forest image
+var Grassland_sample = classified_Grassland.stratifiedSample({
+  numPoints: 100,
+  classBand: 'Grassland',
+  geometries: true
+});
+
+var Grassland_sample = Grassland_sample.map(function(fea) {
+  return fea.set('landcover', 0);
+});
+
+// //-----------------------------------------------forest
+
+var foret_CLCD_2020 = CLCD_2020.eq(2);
+var foret_CLCD_2015 = CLCD_2015.eq(2);
+var foret_ESA = dataset1.eq(10);
+var foret_ESRI = esri10.eq(2);
+var foret_FROM = from_cld.eq(2);
+
+var foret_and = foret_CLCD_2015.and(foret_CLCD_2020).and(foret_ESA).and(foret_ESRI).and(foret_FROM);
+
+var foret1 = foret_and.clip(roi_tmp).rename('forest')
+                                  .set('system:footprint',roi_tmp.geometry());
+                                  
+
+// Define a kernel representing the center pixel and its 8 neighbors
+var kernel = ee.Kernel.fixed(3, 3, [[1, 1, 1], [1, 1, 1], [1, 1, 1]]);
+
+// Define a function to classify pixels based on the kernel
+var classifyCenterPixels = function(image) {
+  var centerPixel = image.reduceNeighborhood({
+    reducer: ee.Reducer.first(),
+    kernel: kernel,
+  });
+  var mask = centerPixel.neq(0).and(centerPixel.eq(image));
+  return image.updateMask(mask);
+};
+
+// Apply the classification function to the forest image
+var classified_forest = classifyCenterPixels(foret1);
+
+// Generate stratified samples from the classified forest image
+var foret_sample = classified_forest.stratifiedSample({
+  numPoints: 100,
+  classBand: 'forest',
+  geometries: true
+});
+
+var foret_sample = foret_sample.map(function(fea) {
+  return fea.set('landcover', 1);
+});
+                                  
+
+// //-----------------------------------------------Cropland
+
+var cropland_CLCD_2020 = CLCD_2020.eq(1);
+var cropland_CLCD_2015 = CLCD_2015.eq(1);
+var cropland_ESA = dataset1.eq(40);
+var cropland_ESRI = esri10.eq(5);
+var cropland_FROM = from_cld.eq(1);
+
+var cropland_and = cropland_CLCD_2015.and(cropland_CLCD_2020).and(cropland_ESA).and(cropland_ESRI).and(cropland_FROM);
+
+var cropland1 = cropland_and.clip(roi_tmp).rename('Cropland')
+                                  .set('system:footprint',roi_tmp.geometry());
+
+// Define a kernel representing the center pixel and its 8 neighbors
+var kernel = ee.Kernel.fixed(3, 3, [[1, 1, 1], [1, 1, 1], [1, 1, 1]]);
+
+// Define a function to classify pixels based on the kernel
+var classifyCenterPixels = function(image) {
+  var centerPixel = image.reduceNeighborhood({
+    reducer: ee.Reducer.first(),
+    kernel: kernel,
+  });
+  var mask = centerPixel.neq(0).and(centerPixel.eq(image));
+  return image.updateMask(mask);
+};
+
+// Apply the classification function to the forest image
+var classified_cropland = classifyCenterPixels(cropland1);
+
+var cropland_sample = classified_cropland.selfMask().stratifiedSample({
+  numPoints:100,
+  classBand:'Cropland',
+  geometries:true
+});
+var cropland_sample = cropland_sample.map(function(fea){
+  return fea.set('landcover',2)
+});
+
+// // // //-----------------------------------------------Water
+
+var water_CLCD_2020 = CLCD_2020.eq(5);
+var water_CLCD_2015 = CLCD_2015.eq(5);
+var water_ESA = dataset1.eq(80);
+var water_ESRI = esri10.eq(1);
+var water_FROM = from_cld.eq(6);
+
+var water_and = water_ESA.and(water_FROM).and(water_ESRI).and(water_CLCD_2020).and(water_CLCD_2015);
+
+var water1 = water_and.clip(roi_tmp).rename('Water')
+                                  .set('system:footprint',roi_tmp.geometry());
+
+
+
+// Define a kernel representing the center pixel and its 8 neighbors
+var kernel = ee.Kernel.fixed(3, 3, [[1, 1, 1], [1, 1, 1], [1, 1, 1]]);
+
+// Define a function to classify pixels based on the kernel
+var classifyCenterPixels = function(image) {
+  var centerPixel = image.reduceNeighborhood({
+    reducer: ee.Reducer.first(),
+    kernel: kernel,
+  });
+  var mask = centerPixel.neq(0).and(centerPixel.eq(image));
+  return image.updateMask(mask);
+};
+
+// Apply the classification function to the forest image
+var classified_water = classifyCenterPixels(water1);
+
+var water_sample = classified_water.selfMask().stratifiedSample({
+  numPoints:100,
+  classBand:'Water',
+  geometries:true
+});
+var water_sample = water_sample.map(function(fea){
+  return fea.set('landcover',3)
+});
+// Map.addLayer(water_sample)
+// // //-----------------------------------------------urban
+
+var urban_CLCD_2020 = CLCD_2020.eq(8);
+var urban_CLCD_2015 = CLCD_2015.eq(8);
+var urban_ESA = dataset1.eq(50);
+var urban_ESRI = esri10.eq(7);
+var urban_FROM = from_cld.eq(8);
+
+var urban_and = urban_ESA.and(urban_ESRI).and(urban_FROM).and(urban_CLCD_2015);
+
+var urban1 = urban_and.clip(roi_tmp).rename('urban')
+                                  .set('system:footprint',roi_tmp.geometry());
+
+
+// Define a kernel representing the center pixel and its 8 neighbors
+var kernel = ee.Kernel.fixed(3, 3, [[1, 1, 1], [1, 1, 1], [1, 1, 1]]);
+
+// Define a function to classify pixels based on the kernel
+var classifyCenterPixels = function(image) {
+  var centerPixel = image.reduceNeighborhood({
+    reducer: ee.Reducer.first(),
+    kernel: kernel,
+  });
+  var mask = centerPixel.neq(0).and(centerPixel.eq(image));
+  return image.updateMask(mask);
+};
+
+// Apply the classification function to the forest image
+var classified_urban = classifyCenterPixels(urban1);
+
+
+var urban_sample = classified_urban.selfMask().stratifiedSample({
+  numPoints:100,
+  classBand:'urban',
+  geometries:true
+});
+var urban_sample = urban_sample.map(function(fea){
+  return fea.set('landcover',4)
+});
+
+// // //-----------------------------------------------Shrubland
+
+var Shrubland_CLCD_2020 = CLCD_2020.eq(3);
+var Shrubland_CLCD_2015 = CLCD_2015.eq(3);
+var Shrubland_ESA = dataset1.eq(20);
+var Shrubland_ESRI = esri10.eq(6);
+var Shrubland_FROM = from_cld.eq(4);
+
+var Shrubland_and = (Shrubland_CLCD_2015.and(Shrubland_CLCD_2020).or(Shrubland_ESA)).and(Shrubland_FROM).and(Shrubland_ESRI);
+
+var Shrubland1 = Shrubland_and.clip(roi_tmp).rename('Shrubland')
+                                  .set('system:footprint',roi_tmp.geometry());
+
+// Define a kernel representing the center pixel and its 8 neighbors
+var kernel = ee.Kernel.fixed(3, 3, [[1, 1, 1], [1, 1, 1], [1, 1, 1]]);
+
+// Define a function to classify pixels based on the kernel
+var classifyCenterPixels = function(image) {
+  var centerPixel = image.reduceNeighborhood({
+    reducer: ee.Reducer.first(),
+    kernel: kernel,
+  });
+  var mask = centerPixel.neq(0).and(centerPixel.eq(image));
+  return image.updateMask(mask);
+};
+
+// Apply the classification function to the forest image
+var classified_Shrubland1 = classifyCenterPixels(Shrubland1);
+
+var Shrubland_sample = classified_Shrubland1.selfMask().stratifiedSample({
+  numPoints:100,
+  classBand:'Shrubland',
+  geometries:true
+});
+var Shrubland_sample = Shrubland_sample.map(function(fea){
+  return fea.set('landcover',5)
+});
+// Map.addLayer(Shrubland_sample);
+// // //-----------------------------------------------other
+var other_FROM1 = from_cld.eq(7);
+var other_FROM2 = from_cld.eq(9);
+var other_FROM3 = from_cld.eq(10);
+var other_FROM4 = from_cld.eq(5);
+var other_FROM = other_FROM1.or(other_FROM2).or(other_FROM3).or(other_FROM4);
+
+var other_CLCD_20201 = CLCD_2020.eq(6);
+var other_CLCD_20202 = CLCD_2020.eq(7);
+var other_CLCD_20203 = CLCD_2020.eq(9);
+var other_CLCD_2020 = other_CLCD_20201.or(other_CLCD_20202).or(other_CLCD_20203);
+
+var other_CLCD_20151 = CLCD_2015.eq(6);
+var other_CLCD_20152 = CLCD_2015.eq(7);
+var other_CLCD_20153 = CLCD_2015.eq(9);
+var other_CLCD_2015 = other_CLCD_20151.or(other_CLCD_20152).or(other_CLCD_20153);
+
+var other_ESA1 = dataset1.eq(60);
+var other_ESA2 = dataset1.eq(70);
+var other_ESA3 = dataset1.eq(90);
+var other_ESA5 = other_ESA1.or(other_ESA2).or(other_ESA3);
+
+var other_and = other_CLCD_2015.and(other_CLCD_2020).and(other_FROM).and(other_ESA5);
+// Map.addLayer(other_and.selfMask(), {'palette':['red']},'other_and');
+
+var other1 = other_and.clip(roi_tmp).rename('other')
+                                  .set('system:footprint',roi_tmp.geometry());
+
+// Define a kernel representing the center pixel and its 8 neighbors
+var kernel = ee.Kernel.fixed(3, 3, [[1, 1, 1], [1, 1, 1], [1, 1, 1]]);
+
+// Define a function to classify pixels based on the kernel
+var classifyCenterPixels = function(image) {
+  var centerPixel = image.reduceNeighborhood({
+    reducer: ee.Reducer.first(),
+    kernel: kernel,
+  });
+  var mask = centerPixel.neq(0).and(centerPixel.eq(image));
+  return image.updateMask(mask);
+};
+
+// Apply the classification function to the forest image
+var classified_other = classifyCenterPixels(other1);
+
+var other_sample = classified_other.selfMask().stratifiedSample({
+  numPoints:100,
+  classBand:'other',
+  geometries:true
+});
+var other_sample = other_sample.map(function(fea){
+  return fea.set('landcover',6)
+})
+
+///Combined sample
+var Grassland_sample0=Grassland_sample0.merge(Grassland_sample)
+var foret_sample0=foret_sample0.merge(foret_sample)
+var cropland_sample0=cropland_sample0.merge(cropland_sample)
+var water_sample0=water_sample0.merge(water_sample)
+var urban_sample0=urban_sample0.merge(urban_sample)
+var Shrubland_sample0=Shrubland_sample0.merge(Shrubland_sample)
+var other_sample0=other_sample0.merge(other_sample)
+
+}
+
+
+var samples = ee.FeatureCollection([Grassland_sample0,foret_sample0,cropland_sample0,water_sample0,urban_sample0,Shrubland_sample0,other_sample0,ot1]).flatten();
+
+
+Map.addLayer(Grassland_and.selfMask(), {'palette':['#73d662']},'Grassland_and',false);
+Map.addLayer(foret_and.selfMask(), {'palette':['green']},'foret_and',false);
+Map.addLayer(cropland_and.selfMask(), {'palette':['yellow']},'cropland_and',false);
+Map.addLayer(urban_and.selfMask(), {'palette':['red']},'urban_and',false);
+Map.addLayer(Shrubland_and.selfMask(), {'palette':['#6dd6be']},'Shrubland_and',false);
+Map.addLayer(other_and.selfMask(), {'palette':['grey']},'other_and',false);
+Map.addLayer(water_and.selfMask(), {'palette':['#3584d6']},'water_and',false);
+Map.addLayer(Grassland_sample0, {'color': 'green'}, 'foret_and');
+print('samples',samples.size());
+
